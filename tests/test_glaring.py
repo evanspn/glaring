@@ -55,6 +55,54 @@ class PodSpec(unittest.TestCase):
             pod(self.base + f"mounts: ['{Path.home()}:/h']\n")
 
 
+class Hardening(unittest.TestCase):
+    base = "name: p\nmodel:\n  provider: none\n"
+
+    def test_wildcards_need_two_labels_and_no_shared_tenants(self):
+        for h in (".com", ".github.io", ".foo.github.io", ".s3.amazonaws.com", ".amazonaws.com", ".co.uk", ".vercel.app", "localhost", "10.0.0.1", ".10.0.0.1"):
+            with self.assertRaises(g.Fail, msg=h):
+                pod(self.base + f"egress: ['{h}']\n")
+        pod(self.base + "egress: ['.example.org', 'api.github.com']\n")
+
+    def test_region_and_base_url_cannot_inject(self):
+        for m in ("provider: bedrock\n  region: 'us-west-2 .com'",
+                  "provider: bedrock\n  region: 'us-west-2\"\\nx=1'",
+                  "provider: custom\n  base_url: 'http://x.example.org/v1'",
+                  "provider: custom\n  base_url: 'https://user:pw@x.example.org/v1'",
+                  "provider: custom\n  base_url: 'https://x.example.org:8443/v1'",
+                  "provider: custom\n  base_url: 'https://127.0.0.1/v1'",
+                  "provider: openai\n  model: 'a\"b'"):
+            with self.assertRaises(g.Fail, msg=m):
+                pod(f"name: p\nmodel:\n  {m}\n")
+
+    def test_toml_is_escaped(self):
+        t = g.codex_toml({"provider": "custom", "base_url": "https://x.example.org/v1", "model": "m", "env_key": "K"})
+        self.assertIn('base_url = "https://x.example.org/v1"', t)
+
+    def test_mount_denylist(self):
+        home = Path.home()
+        with tempfile.TemporaryDirectory(dir=home) as d:
+            link = Path(d) / "link"
+            link.symlink_to(home)
+            sock = Path(d) / "x.sock"
+            import socket
+            s = socket.socket(socket.AF_UNIX); s.bind(str(sock)); s.close()
+            bad = [str(home), str(home.parent), "/", "/etc", str(link), str(sock), str(home / ".ssh"), str(home / ".aws"),
+                   str(home / ".local/state/glaring")]
+            for src in bad:
+                if Path(src).exists():
+                    with self.assertRaises(g.Fail, msg=src):
+                        pod(self.base + f"mounts: ['{src}:/m']\n")
+            ok = Path(d) / "data"; ok.mkdir()
+            self.assertEqual(len(pod(self.base + f"mounts: ['{ok}:/m']\n")["_mounts"]), 1)
+
+    def test_rig_confined_to_rigs_dir(self):
+        for r in ("../../etc/passwd.yaml", "/etc/hosts", "pods/builder.yaml", "rigs/../glaring"):
+            with self.assertRaises(g.Fail, msg=r):
+                pod(self.base + f"rig: {r}\n")
+        self.assertIn("_rig", pod(self.base + "rig: rigs/example/builder.yaml\n"))
+
+
 class Backend(unittest.TestCase):
     def test_bedrock_pluggable(self):
         t = g.codex_toml({"provider": "bedrock", "region": "eu-west-1", "model": "openai.gpt-5.5"})
@@ -81,8 +129,10 @@ class Proxy(unittest.TestCase):
         c = g.squid_conf(["api.github.com"])
         self.assertIn("http_access deny all", c)
         self.assertLess(c.index("allow CONNECT allowed"), c.index("deny all"))
-        self.assertIn("acl allowed dstdomain api.github.com", c)
-        self.assertIn(".invalid", g.squid_conf([]))
+        self.assertIn("acl allowed dstdomain -n api.github.com", c)
+        self.assertIn("-n .invalid", g.squid_conf([]))
+        # every allowlist line must disable reverse-DNS matching of IP-literal CONNECTs
+        self.assertTrue(all(" -n " in l for l in c.splitlines() if l.startswith("acl allowed")))
 
 
 class AwsCreds(unittest.TestCase):
@@ -101,6 +151,19 @@ class AwsCreds(unittest.TestCase):
         self.assertIn("aws_session_token = tok", text)
         self.assertNotIn("work", text)  # the profile name/config never travels
         self.assertTrue(text.startswith("[default]"))
+
+    def test_refuses_long_lived_keys(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake = Path(d) / "aws"
+            fake.write_text("#!/bin/sh\necho \"export AWS_ACCESS_KEY_ID=AKIAFAKE\"\necho \"export AWS_SECRET_ACCESS_KEY=s\"\n")
+            fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+            old = os.environ["PATH"]
+            os.environ["PATH"] = f"{d}:{old}"
+            try:
+                with self.assertRaises(g.Fail):
+                    g.aws_credentials_text("work")
+            finally:
+                os.environ["PATH"] = old
 
 
 if __name__ == "__main__":

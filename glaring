@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parent
 PREFIX = "glaring"
@@ -110,9 +111,69 @@ def load_yaml(text):
 # ---------------------------------------------------------------- pod specs
 NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,30}$")
 HOST_RE = re.compile(r"^\.?[a-z0-9]([a-z0-9.-]*[a-z0-9])?$")
+IPV4_RE = re.compile(r"^\.?\d+\.\d+\.\d+\.\d+$")
+REGION_RE = re.compile(r"^[a-z]{2}(-[a-z]+)+-\d$")
+MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,100}$")
+# Shared-tenant suffixes: allowing "*.suffix" would allow anyone's content there.
+SHARED_SUFFIXES = (
+    "github.io", "githubusercontent.com", "githubassets.com", "amazonaws.com", "cloudfront.net", "vercel.app",
+    "netlify.app", "herokuapp.com", "azurewebsites.net", "blob.core.windows.net", "appspot.com", "pages.dev",
+    "workers.dev", "web.app", "firebaseapp.com", "ngrok.io", "ngrok-free.app", "trycloudflare.com",
+    "onrender.com", "fly.dev", "repl.co", "glitch.me", "surge.sh", "r2.dev", "cloudapp.azure.com",
+)
+TWO_LABEL_PUBLIC_SUFFIXES = ("co.uk", "org.uk", "ac.uk", "com.au", "co.jp", "co.nz", "com.br", "co.in")
+
+
+def check_host(h, where, allow_wildcard=True):
+    if not isinstance(h, str) or not HOST_RE.match(h) or ".." in h or IPV4_RE.match(h):
+        raise Fail(f"{where}: bad host {h!r} (hostnames only, no IP literals; '.example.com' allows subdomains)")
+    bare = h.lstrip(".")
+    labels = bare.split(".")
+    if len(labels) < 2 or not labels[-1].isalpha():
+        raise Fail(f"{where}: host {h!r} needs at least two labels (e.g. api.example.com)")
+    if h.startswith("."):
+        if not allow_wildcard:
+            raise Fail(f"{where}: wildcard host {h!r} not allowed here")
+        if bare in TWO_LABEL_PUBLIC_SUFFIXES or any(bare == x or bare.endswith("." + x) for x in SHARED_SUFFIXES):
+            raise Fail(f"{where}: wildcard {h!r} covers a shared-tenant or public suffix; name the exact host instead")
+    return h
+
 SECRET_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 MEM_RE = re.compile(r"^\d+[mg]$")
 PROVIDERS = ("bedrock", "openai", "custom", "none")
+
+
+HOME_DENY = (".ssh", ".aws", ".gnupg", ".config", ".docker", ".kube", ".npmrc", ".netrc", ".codex", ".claude",
+             ".openrig", ".local/state", ".local/share", ".cache", ".azure", ".gcloud", "Library", ".colima", ".lima")
+SYSTEM_DENY = ("/etc", "/proc", "/sys", "/dev", "/run", "/var/run", "/var/lib/docker", "/root", "/boot", "/private/etc",
+               "/private/var/run", "/var/root")
+
+
+def check_mount_source(host, path):
+    """Resolve symlinks first, then refuse sockets, home and its ancestors,
+    credential/state dirs, and system dirs. A read-only docker.sock is still
+    host root, so sockets are refused outright."""
+    import stat as _stat
+    real = Path(os.path.realpath(host))
+    if not real.exists():
+        raise Fail(f"{path}: mount source {host} does not exist")
+    if _stat.S_ISSOCK(real.stat().st_mode) or real.name.endswith(".sock"):
+        raise Fail(f"{path}: refusing to mount socket {real}")
+    home = Path(os.path.realpath(Path.home()))
+    if real == home or real in home.parents or real == Path("/"):
+        raise Fail(f"{path}: refusing to mount {real} (your home directory or an ancestor of it)")
+    for d in HOME_DENY:
+        deny = home / d
+        if real == deny or deny in real.parents:
+            raise Fail(f"{path}: refusing to mount {real} (credential/state directory)")
+    state = Path(os.path.realpath(STATE))
+    if real == state or state in real.parents or real in state.parents:
+        raise Fail(f"{path}: refusing to mount glaring's own state directory")
+    for d in SYSTEM_DENY:
+        dd = Path(os.path.realpath(d))
+        if real == dd or dd in real.parents:
+            raise Fail(f"{path}: refusing to mount system path {real}")
+    return real
 
 
 def load_pod(path):
@@ -131,8 +192,7 @@ def load_pod(path):
         if not isinstance(spec[key], list):
             raise Fail(f"{path}: '{key}' must be a list")
     for h in spec["egress"]:
-        if not isinstance(h, str) or not HOST_RE.match(h):
-            raise Fail(f"{path}: bad egress host {h!r} (hostnames only; '.example.com' allows subdomains)")
+        check_host(h, f"{path}: egress")
     for s in spec["secrets"]:
         if not isinstance(s, str) or not SECRET_RE.match(s):
             raise Fail(f"{path}: bad secret name {s!r}")
@@ -146,15 +206,20 @@ def load_pod(path):
             raise Fail(f"{path}: mount {m!r} must be 'host_path:/container/path' (always read-only)")
         host = Path(parts[0]).expanduser()
         if not host.is_absolute():
-            host = (Path(path).resolve().parent.parent / host).resolve()
-        if str(host) in ("/", str(Path.home())):
-            raise Fail(f"{path}: refusing to mount {host}")
-        mounts.append((host, parts[1]))
+            host = Path(path).resolve().parent.parent / host
+        mounts.append((check_mount_source(host, path), parts[1]))
     spec["_mounts"] = mounts
     model = spec.get("model") or {"provider": "none"}
     if model.get("provider") not in PROVIDERS:
         raise Fail(f"{path}: model.provider must be one of {PROVIDERS}")
+    validate_model(model, f"{path}: model")
     spec["model"] = model
+    if spec.get("rig"):
+        rig = Path(os.path.realpath(ROOT / str(spec["rig"])))
+        rigs_root = Path(os.path.realpath(ROOT / "rigs"))
+        if rigs_root not in rig.parents or rig.suffix != ".yaml":
+            raise Fail(f"{path}: rig must be a .yaml file under {rigs_root}")
+        spec["_rig"] = rig
     spec["_path"] = str(path)
     return spec
 
@@ -182,6 +247,30 @@ def load_pods(directory, names=None):
 
 
 # ------------------------------------------------------------- model backend
+def validate_model(model, where="model"):
+    prov = model.get("provider")
+    if prov == "bedrock":
+        region = str(model.get("region", "us-west-2"))
+        if not REGION_RE.match(region):
+            raise Fail(f"{where}: bad AWS region {region!r}")
+    if model.get("model") is not None and not MODEL_RE.match(str(model["model"])):
+        raise Fail(f"{where}: bad model id {model['model']!r}")
+    if prov == "custom":
+        base = str(model.get("base_url", ""))
+        u = urlsplit(base)
+        if u.scheme != "https" or not u.hostname or u.username or u.password or u.port not in (None, 443):
+            raise Fail(f"{where}: base_url must be https://host/... (no credentials, default port)")
+        check_host(u.hostname, f"{where}.base_url", allow_wildcard=False)
+        if not re.fullmatch(r"https://[a-z0-9.-]+(/[A-Za-z0-9._~/-]*)?", base):
+            raise Fail(f"{where}: base_url has unsupported characters")
+        if not SECRET_RE.match(str(model.get("env_key", "CUSTOM_API_KEY"))):
+            raise Fail(f"{where}: env_key must be an env var name")
+
+
+def toml_str(v):
+    return json.dumps(str(v))  # a JSON string is a valid TOML basic string
+
+
 def model_hosts(model):
     prov = model.get("provider")
     if prov == "bedrock":
@@ -200,28 +289,28 @@ def codex_toml(model):
     lines = ['# rendered by glaring; no secrets here', 'sandbox_mode = "danger-full-access"  # the container is the sandbox', 'approval_policy = "never"']
     if prov == "bedrock":
         lines += [
-            f'model = "{model.get("model", "openai.gpt-5.5")}"',
+            f'model = {toml_str(model.get("model", "openai.gpt-5.5"))}',
             'model_provider = "amazon-bedrock"',
             "",
             "[model_providers.amazon-bedrock.aws]",
-            f'region = "{model.get("region", "us-west-2")}"',
+            f'region = {toml_str(model.get("region", "us-west-2"))}',
             'wire_api = "responses"',
         ]
     elif prov == "openai":
         if model.get("model"):
-            lines.append(f'model = "{model["model"]}"')
+            lines.append(f'model = {toml_str(model["model"])}')
     elif prov == "custom":
         env_key = model.get("env_key", "CUSTOM_API_KEY")
         if not SECRET_RE.match(str(env_key)):
             raise Fail("model.env_key must be an env var name")
         lines += [
-            f'model = "{model.get("model", "default")}"',
+            f'model = {toml_str(model.get("model", "default"))}',
             'model_provider = "custom"',
             "",
             "[model_providers.custom]",
             'name = "custom"',
-            f'base_url = "{model["base_url"]}"',
-            f'env_key = "{env_key}"',
+            f'base_url = {toml_str(model["base_url"])}',
+            f'env_key = {toml_str(env_key)}',
             'wire_api = "responses"',
         ]
     return "\n".join(lines) + "\n" if prov != "none" else None
@@ -245,9 +334,11 @@ def aws_credentials_text(profile):
     needed = ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY")
     if not all(k in env for k in needed):
         raise Fail("export-credentials returned no keys")
+    if not env.get("AWS_SESSION_TOKEN"):
+        raise Fail(f"AWS profile {profile!r} yields long-lived keys (no session token); refusing to copy them into a pod. "
+                   "Use an SSO or assume-role profile (short-lived credentials).")
     out = ["[default]", f"aws_access_key_id = {env['AWS_ACCESS_KEY_ID']}", f"aws_secret_access_key = {env['AWS_SECRET_ACCESS_KEY']}"]
-    if env.get("AWS_SESSION_TOKEN"):
-        out.append(f"aws_session_token = {env['AWS_SESSION_TOKEN']}")
+    out.append(f"aws_session_token = {env['AWS_SESSION_TOKEN']}")
     return "\n".join(out) + "\n"
 
 
@@ -305,7 +396,7 @@ def egress_name(pod):
 
 
 def squid_conf(hosts):
-    acl = "\n".join(f"acl allowed dstdomain {h if h.startswith('.') else h}" for h in hosts) if hosts else "acl allowed dstdomain .invalid"
+    acl = "\n".join(f"acl allowed dstdomain -n {h}" for h in hosts) if hosts else "acl allowed dstdomain -n .invalid"
     return f"""# rendered by glaring: default deny, hostname allowlist, HTTPS only
 http_port 3128
 {acl}
@@ -392,14 +483,11 @@ def up_pod(pod, pods, envfile_vars, aws_profile, base_allow):
         extra += ["-v", f"{cred}:/run/glaring/aws/credentials:ro"]
     if toml:
         extra += ["-v", f"{d / 'codex.toml'}:/etc/glaring/codex.toml:ro"]
-    if spec.get("rig"):
-        rig = (ROOT / spec["rig"]).resolve()
-        if not rig.is_file():
+    if spec.get("_rig"):
+        if not spec["_rig"].is_file():
             raise Fail(f"pod {pod}: rig file {spec['rig']} not found")
-        extra += ["-v", f"{rig}:/rig/rig.yaml:ro"]
+        extra += ["-v", f"{spec['_rig']}:/rig/rig.yaml:ro"]
     for host, target in spec["_mounts"]:
-        if not host.exists():
-            raise Fail(f"pod {pod}: mount source {host} does not exist")
         extra += ["-v", f"{host}:{target}:ro"]
 
     tmp = Path(tempfile.mkdtemp(prefix="glaring-env-"))

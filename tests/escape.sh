@@ -66,6 +66,17 @@ for p in $PODS; do
   refuse "$p: cannot reach the cloud metadata address" inpod $p curl -s --noproxy '*' -m 3 -o /dev/null http://169.254.169.254/
 done
 
+echo "== DNS and IP-literal bypass attempts"
+for p in $PODS; do
+  refuse "$p: external DNS names do not resolve (no DNS exfiltration channel)" inpod $p sh -c 'getent hosts example.com || getent hosts abc123.exfil.example.org'
+done
+GH_IP=$(python3 -c 'import socket;print(socket.gethostbyname("api.github.com"))' 2>/dev/null || true)
+if [ -n "$GH_IP" ]; then
+  refuse "builder: CONNECT to an IP literal of an allowed host is denied (no reverse-DNS match)" inpod builder curl -sfk -m 8 -o /dev/null "https://$GH_IP/"
+else
+  echo "skip IP-literal test (could not resolve api.github.com on the host)"
+fi
+
 echo "== allowlist works where it should"
 expect "builder: allowed host (api.github.com) is reachable through the proxy" inpod builder curl -s -m 15 -o /dev/null https://api.github.com
 refuse "orchestrator: api.github.com is NOT on its allowlist" inpod orchestrator curl -sf -m 8 -o /dev/null https://api.github.com
