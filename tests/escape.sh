@@ -4,7 +4,7 @@
 # Each check tries to do something a compromised pod would try, and passes only
 # when it FAILS to. Exit code is the number of failed checks (0 = all held).
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 PODS="orchestrator builder qa intruder"
 fails=0; passes=0
 pass() { echo "ok   $*"; passes=$((passes+1)); }

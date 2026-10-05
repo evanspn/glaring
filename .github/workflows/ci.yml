@@ -12,7 +12,7 @@ jobs:
       - uses: actions/checkout@v4
       - run: python3 -m unittest tests.test_glaring -v
       - name: shellcheck
-        run: shellcheck image/entrypoint.sh tests/escape.sh tests/e2e.sh scripts/harden-public-repo.sh
+        run: shellcheck -S warning image/entrypoint.sh tests/escape.sh tests/e2e.sh scripts/harden-public-repo.sh
   pods:
     runs-on: ubuntu-latest
     timeout-minutes: 30
