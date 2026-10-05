@@ -82,7 +82,7 @@ for p in $PODS; do
 done
 refuse "intruder: cannot read another pod's token from its environment" inpod intruder sh -c 'env | grep -q PEER_'
 refuse "orchestrator: cannot read builder's secrets via /proc" inpod orchestrator sh -c 'cat /proc/*/environ 2>/dev/null | tr "\0" "\n" | grep -q "^GITHUB_TOKEN="'
-refuse "docker env of qa does not contain builder's GITHUB_TOKEN" sh -c "docker inspect glaring-qa | grep -q ghp_FAKE"
+refuse "docker env of qa does not contain builder's GITHUB_TOKEN" sh -c "docker inspect glaring-qa | grep -q fake-github-token"
 
 echo "== pods cannot reach each other except the authenticated OpenRig API"
 refuse "intruder: cannot call builder's daemon without the bearer token" inpod intruder curl -sf -m 5 http://glaring-builder:7433/api/ps
