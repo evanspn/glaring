@@ -14,7 +14,7 @@ trustworthy.
 | Default-deny egress: pods sit on `internal` Docker networks with no route out; the only way out is that pod's own Squid proxy with a hostname allowlist, HTTPS (CONNECT to 443) only | `proxy/`, `squid_conf` | `tests/escape.sh` |
 | Per-pod secrets: each pod receives only the env names it declares, via a temporary 0600 `--env-file` that is deleted right after the container is created | `up_pod` | `tests/escape.sh` |
 | No long-lived AWS keys or profile in a pod: the host exports short-lived keys for one profile; the pod gets a one-profile credentials file, read-only | `aws_credentials_text` | unit test, `tests/escape.sh` |
-| Pods cannot use each other's proxies or secrets; peer daemons need a per-pod bearer token (OpenRig refuses a non-loopback bind without one) | `up_pod` | `tests/escape.sh` |
+| Pods cannot use each other's proxies or secrets, and cannot drive another pod's daemon except through a declared peer; peer daemons need a per-pod bearer token (OpenRig refuses a non-loopback bind without one) | `up_pod` | `tests/escape.sh` |
 | Proxy and container logs live in Docker on the host, not in the pod | `glaring logs` | manual |
 
 ## What it does NOT protect
