@@ -1,0 +1,10 @@
+name: orchestrator
+rig: rigs/standin/orchestrator.yaml
+cpus: 1
+memory: 1g
+pids: 256
+model:
+  provider: none
+egress: []
+secrets: []
+peers: [builder, qa]

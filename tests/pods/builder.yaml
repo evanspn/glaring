@@ -1,0 +1,11 @@
+name: builder
+rig: rigs/standin/builder.yaml
+cpus: 1
+memory: 1g
+pids: 256
+model:
+  provider: openai
+egress:
+  - api.github.com
+secrets: [GITHUB_TOKEN]
+peers: [orchestrator, qa]

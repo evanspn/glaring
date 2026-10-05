@@ -1,0 +1,17 @@
+# Pod spec for "builder". Subset of YAML: maps, lists, scalars (see README).
+name: builder
+image: glaring-pod:latest
+rig: rigs/example/builder.yaml
+cpus: 2
+memory: 4g
+pids: 512
+model:
+  provider: bedrock          # bedrock | openai | custom | none
+  region: us-west-2
+  model: openai.gpt-5.5      # Bedrock model id (assumed, unverified)
+egress:                      # extra allowed hosts for this pod, on top of the model backend
+  - api.github.com
+  - github.com
+secrets: [GITHUB_TOKEN]
+peers: [orchestrator, qa]
+mounts: []                   # read-only host mounts: ["./some/dir:/data"]

@@ -1,0 +1,4 @@
+# Hosts EVERY pod may reach on top of its model backend and its own `egress:`
+# list. Empty by default: default deny means default deny. Hostnames only;
+# a leading dot allows subdomains (".example.com").
+allow: []

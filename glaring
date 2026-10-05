@@ -1,0 +1,543 @@
+#!/usr/bin/env python3
+"""glaring: run OpenRig pods as hardened containers.
+
+Pure Python 3 standard library plus the docker CLI, so it runs on a Linux or
+macOS laptop with Docker, Colima or Podman (docker-compatible CLI) and no
+other installs. See README.md and SECURITY.md.
+"""
+import argparse
+import json
+import os
+import re
+import secrets
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+PREFIX = "glaring"
+MESH = f"{PREFIX}-mesh"
+OUT = f"{PREFIX}-out"
+POD_IMAGE_DEFAULT = f"{PREFIX}-pod:latest"
+PROXY_IMAGE = f"{PREFIX}-proxy:latest"
+STATE = Path(os.environ.get("GLARING_STATE", Path.home() / ".local/state/glaring"))
+DOCKER = os.environ.get("GLARING_DOCKER", "docker")
+POD_UID = "10001:10001"
+
+
+class Fail(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- tiny YAML
+def _scalar(s):
+    s = s.strip()
+    if s == "" or s == "~" or s == "null":
+        return None
+    if s[0] in "\"'" and s[-1] == s[0] and len(s) >= 2:
+        return s[1:-1]
+    if s[0] == "[" and s[-1] == "]":
+        inner = s[1:-1].strip()
+        return [_scalar(x) for x in inner.split(",")] if inner else []
+    if s in ("true", "false"):
+        return s == "true"
+    if re.fullmatch(r"-?\d+", s):
+        return int(s)
+    return s
+
+
+def _strip_comment(line):
+    out, quote = [], None
+    for i, ch in enumerate(line):
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+        elif ch == "#" and (i == 0 or line[i - 1] in " \t"):
+            break
+        out.append(ch)
+    return "".join(out).rstrip()
+
+
+def load_yaml(text):
+    """Strict subset: nested maps (2-space indent), lists of scalars, inline
+    [a, b] lists, quoted/plain scalars, # comments. Anything else is an error."""
+    rows = []
+    for n, raw in enumerate(text.splitlines(), 1):
+        line = _strip_comment(raw)
+        if not line.strip():
+            continue
+        if "\t" in line[: len(line) - len(line.lstrip())]:
+            raise Fail(f"line {n}: tabs are not allowed")
+        rows.append((len(line) - len(line.lstrip()), line.strip(), n))
+
+    def block(i, indent):
+        if i >= len(rows):
+            return None, i
+        if rows[i][1].startswith("- "):
+            items = []
+            while i < len(rows) and rows[i][0] == indent and rows[i][1].startswith("- "):
+                items.append(_scalar(rows[i][1][2:]))
+                i += 1
+            return items, i
+        out = {}
+        while i < len(rows) and rows[i][0] == indent:
+            _, content, n = rows[i]
+            m = re.fullmatch(r"([A-Za-z0-9_.-]+):(?:\s+(.*))?", content)
+            if not m:
+                raise Fail(f"line {n}: expected 'key: value', got {content!r}")
+            key, rest = m.group(1), m.group(2)
+            i += 1
+            if rest is not None and rest != "":
+                out[key] = _scalar(rest)
+            elif i < len(rows) and rows[i][0] > indent:
+                out[key], i = block(i, rows[i][0])
+            else:
+                out[key] = None
+        if i < len(rows) and rows[i][0] > indent:
+            raise Fail(f"line {rows[i][2]}: unexpected indentation")
+        return out, i
+
+    value, i = block(0, rows[0][0]) if rows else ({}, 0)
+    if i != len(rows):
+        raise Fail(f"line {rows[i][2]}: could not parse")
+    return value
+
+
+# ---------------------------------------------------------------- pod specs
+NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,30}$")
+HOST_RE = re.compile(r"^\.?[a-z0-9]([a-z0-9.-]*[a-z0-9])?$")
+SECRET_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+MEM_RE = re.compile(r"^\d+[mg]$")
+PROVIDERS = ("bedrock", "openai", "custom", "none")
+
+
+def load_pod(path):
+    spec = load_yaml(Path(path).read_text()) or {}
+    name = spec.get("name")
+    if not isinstance(name, str) or not NAME_RE.match(name):
+        raise Fail(f"{path}: 'name' must match {NAME_RE.pattern}")
+    spec.setdefault("image", POD_IMAGE_DEFAULT)
+    spec["cpus"] = spec.get("cpus", 2)
+    spec["memory"] = str(spec.get("memory", "4g"))
+    spec["pids"] = int(spec.get("pids", 512))
+    if not MEM_RE.match(spec["memory"]):
+        raise Fail(f"{path}: memory must look like 512m or 4g")
+    for key in ("egress", "secrets", "peers", "mounts"):
+        spec[key] = spec.get(key) or []
+        if not isinstance(spec[key], list):
+            raise Fail(f"{path}: '{key}' must be a list")
+    for h in spec["egress"]:
+        if not isinstance(h, str) or not HOST_RE.match(h):
+            raise Fail(f"{path}: bad egress host {h!r} (hostnames only; '.example.com' allows subdomains)")
+    for s in spec["secrets"]:
+        if not isinstance(s, str) or not SECRET_RE.match(s):
+            raise Fail(f"{path}: bad secret name {s!r}")
+    for p in spec["peers"]:
+        if not isinstance(p, str) or not NAME_RE.match(p) or p == name:
+            raise Fail(f"{path}: bad peer {p!r}")
+    mounts = []
+    for m in spec["mounts"]:
+        parts = str(m).split(":")
+        if len(parts) != 2 or not parts[1].startswith("/"):
+            raise Fail(f"{path}: mount {m!r} must be 'host_path:/container/path' (always read-only)")
+        host = Path(parts[0]).expanduser()
+        if not host.is_absolute():
+            host = (Path(path).resolve().parent.parent / host).resolve()
+        if str(host) in ("/", str(Path.home())):
+            raise Fail(f"{path}: refusing to mount {host}")
+        mounts.append((host, parts[1]))
+    spec["_mounts"] = mounts
+    model = spec.get("model") or {"provider": "none"}
+    if model.get("provider") not in PROVIDERS:
+        raise Fail(f"{path}: model.provider must be one of {PROVIDERS}")
+    spec["model"] = model
+    spec["_path"] = str(path)
+    return spec
+
+
+def load_pods(directory, names=None):
+    files = sorted(Path(directory).glob("*.yaml"))
+    if not files:
+        raise Fail(f"no pod specs in {directory}")
+    pods = {}
+    for f in files:
+        p = load_pod(f)
+        if p["name"] in pods:
+            raise Fail(f"duplicate pod name {p['name']}")
+        pods[p["name"]] = p
+    for p in pods.values():
+        for peer in p["peers"]:
+            if peer not in pods:
+                raise Fail(f"pod {p['name']}: unknown peer {peer}")
+    if names:
+        missing = [n for n in names if n not in pods]
+        if missing:
+            raise Fail(f"unknown pod(s): {', '.join(missing)}")
+        pods = {n: pods[n] for n in names}
+    return pods
+
+
+# ------------------------------------------------------------- model backend
+def model_hosts(model):
+    prov = model.get("provider")
+    if prov == "bedrock":
+        region = model.get("region", "us-west-2")
+        return [f"bedrock-runtime.{region}.amazonaws.com", f"sts.{region}.amazonaws.com"]
+    if prov == "openai":
+        return ["api.openai.com", "auth.openai.com", "chatgpt.com"]
+    if prov == "custom":
+        m = re.match(r"https?://([^/:]+)", str(model.get("base_url", "")))
+        return [m.group(1)] if m else []
+    return []
+
+
+def codex_toml(model):
+    prov = model.get("provider")
+    lines = ['# rendered by glaring; no secrets here', 'sandbox_mode = "danger-full-access"  # the container is the sandbox', 'approval_policy = "never"']
+    if prov == "bedrock":
+        lines += [
+            f'model = "{model.get("model", "openai.gpt-5.5")}"',
+            'model_provider = "amazon-bedrock"',
+            "",
+            "[model_providers.amazon-bedrock.aws]",
+            f'region = "{model.get("region", "us-west-2")}"',
+            'wire_api = "responses"',
+        ]
+    elif prov == "openai":
+        if model.get("model"):
+            lines.append(f'model = "{model["model"]}"')
+    elif prov == "custom":
+        env_key = model.get("env_key", "CUSTOM_API_KEY")
+        if not SECRET_RE.match(str(env_key)):
+            raise Fail("model.env_key must be an env var name")
+        lines += [
+            f'model = "{model.get("model", "default")}"',
+            'model_provider = "custom"',
+            "",
+            "[model_providers.custom]",
+            'name = "custom"',
+            f'base_url = "{model["base_url"]}"',
+            f'env_key = "{env_key}"',
+            'wire_api = "responses"',
+        ]
+    return "\n".join(lines) + "\n" if prov != "none" else None
+
+
+def aws_credentials_text(profile):
+    """Resolve the work profile ON THE HOST into short-lived keys. The pod
+    never sees the profile, its config, the SSO cache or any long-lived key."""
+    if not shutil.which("aws"):
+        raise Fail("model.provider=bedrock needs the AWS CLI v2 on the host (aws configure export-credentials), "
+                   "or put AWS_BEARER_TOKEN_BEDROCK in the pod's secrets")
+    r = subprocess.run(["aws", "configure", "export-credentials", "--profile", profile, "--format", "env"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        raise Fail(f"could not export credentials for AWS profile {profile!r} (try 'aws sso login --profile {profile}')")
+    env = {}
+    for line in r.stdout.splitlines():
+        m = re.match(r"(?:export )?(AWS_[A-Z_]+)=(.*)", line.strip())
+        if m:
+            env[m.group(1)] = m.group(2).strip("'\"")
+    needed = ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY")
+    if not all(k in env for k in needed):
+        raise Fail("export-credentials returned no keys")
+    out = ["[default]", f"aws_access_key_id = {env['AWS_ACCESS_KEY_ID']}", f"aws_secret_access_key = {env['AWS_SECRET_ACCESS_KEY']}"]
+    if env.get("AWS_SESSION_TOKEN"):
+        out.append(f"aws_session_token = {env['AWS_SESSION_TOKEN']}")
+    return "\n".join(out) + "\n"
+
+
+# --------------------------------------------------------------------- docker
+def run(args, check=True, capture=True, input_text=None):
+    r = subprocess.run([DOCKER] + list(args), capture_output=capture, text=True, input=input_text)
+    if check and r.returncode != 0:
+        raise Fail(f"docker {' '.join(args[:3])} failed: {(r.stderr or '').strip()[:400]}")
+    return r
+
+
+def exists(kind, name):
+    return run([kind, "inspect", name], check=False).returncode == 0
+
+
+def ensure_network(name, internal):
+    if not exists("network", name):
+        run(["network", "create"] + (["--internal"] if internal else []) + [name])
+
+
+def parse_env_file(path):
+    env = {}
+    if path and Path(path).exists():
+        for line in Path(path).read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            env[k.strip()] = v.strip().strip("'\"")
+    return env
+
+
+def tokens():
+    STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
+    f = STATE / "tokens.json"
+    data = json.loads(f.read_text()) if f.exists() else {}
+    return data, f
+
+
+def pod_token(name):
+    data, f = tokens()
+    if name not in data:
+        data[name] = secrets.token_hex(24)
+        f.write_text(json.dumps(data))
+        f.chmod(0o600)
+    return data[name]
+
+
+def cname(pod):
+    return f"{PREFIX}-{pod}"
+
+
+def egress_name(pod):
+    return f"{PREFIX}-egress-{pod}"
+
+
+def squid_conf(hosts):
+    acl = "\n".join(f"acl allowed dstdomain {h if h.startswith('.') else h}" for h in hosts) if hosts else "acl allowed dstdomain .invalid"
+    return f"""# rendered by glaring: default deny, hostname allowlist, HTTPS only
+http_port 3128
+{acl}
+acl SSL_ports port 443
+acl CONNECT method CONNECT
+http_access deny CONNECT !SSL_ports
+http_access allow CONNECT allowed
+http_access deny all
+cache deny all
+access_log stdio:/dev/stdout
+cache_log /dev/stderr
+pid_filename /tmp/squid.pid
+coredump_dir /tmp
+via off
+forwarded_for delete
+"""
+
+
+def pod_dir(pod):
+    d = STATE / "pods" / pod
+    d.mkdir(parents=True, exist_ok=True)
+    d.chmod(0o700)
+    return d
+
+
+def up_pod(pod, pods, envfile_vars, aws_profile, base_allow):
+    spec = pods[pod]
+    d = pod_dir(pod)
+    model = spec["model"]
+    hosts = sorted(set(base_allow + model_hosts(model) + spec["egress"]))
+    (d / "squid.conf").write_text(squid_conf(hosts))
+    (d / "squid.conf").chmod(0o644)
+    toml = codex_toml(model)
+    if toml:
+        (d / "codex.toml").write_text(toml)
+        (d / "codex.toml").chmod(0o644)
+
+    for nm in (cname(pod), egress_name(pod)):
+        run(["rm", "-f", nm], check=False)
+    eg_net = f"{PREFIX}-eg-{pod}"
+    ensure_network(MESH, internal=True)
+    ensure_network(OUT, internal=False)
+    ensure_network(eg_net, internal=True)
+
+    # proxy
+    run(["create", "--name", egress_name(pod), "--network", eg_net, "--read-only",
+         "--tmpfs", "/var/run:rw,size=8m", "--tmpfs", "/tmp:rw,size=16m", "--tmpfs", "/var/log/squid:rw,size=16m",
+         "--tmpfs", "/var/spool/squid:rw,size=16m", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+         "--pids-limit", "128", "--memory", "256m", "--restart", "no", "--init",
+         "-v", f"{d / 'squid.conf'}:/etc/squid/squid.conf:ro", PROXY_IMAGE])
+    run(["network", "connect", OUT, egress_name(pod)])
+    run(["start", egress_name(pod)])
+
+    # secrets: only the names this pod declares
+    env = {"GLARING_POD": pod, "OPENRIG_AUTH_BEARER_TOKEN": pod_token(pod)}
+    peers = []
+    for peer in spec["peers"]:
+        var = f"PEER_{peer.upper().replace('-', '_')}_TOKEN"
+        env[var] = pod_token(peer)
+        peers.append(f"{peer}=http://{cname(peer)}:7433={var}")
+    env["GLARING_PEERS"] = ";".join(peers)
+    for s in spec["secrets"]:
+        if s not in envfile_vars or envfile_vars[s] == "":
+            print(f"warning: pod {pod}: secret {s} is not set in the env file", file=sys.stderr)
+        else:
+            env[s] = envfile_vars[s]
+    proxy = f"http://{egress_name(pod)}:3128"
+    no_proxy = ",".join(["localhost", "127.0.0.1"] + [cname(p) for p in spec["peers"]])
+    env.update({"HTTPS_PROXY": proxy, "HTTP_PROXY": proxy, "https_proxy": proxy, "http_proxy": proxy,
+                "NO_PROXY": no_proxy, "no_proxy": no_proxy})
+
+    extra = []
+    if model.get("provider") == "bedrock" and "AWS_BEARER_TOKEN_BEDROCK" not in spec["secrets"]:
+        if not aws_profile:
+            raise Fail(f"pod {pod} uses Bedrock: pass --aws-profile NAME (or set AWS_PROFILE)")
+        cdir = d / "aws"
+        cdir.mkdir(exist_ok=True)
+        cdir.chmod(0o755)
+        cred = cdir / "credentials"
+        cred.write_text(aws_credentials_text(aws_profile))
+        cred.chmod(0o644)  # parent dir 0700 keeps other host users out
+        env["AWS_SHARED_CREDENTIALS_FILE"] = "/run/glaring/aws/credentials"
+        env["AWS_REGION"] = model.get("region", "us-west-2")
+        extra += ["-v", f"{cred}:/run/glaring/aws/credentials:ro"]
+    if toml:
+        extra += ["-v", f"{d / 'codex.toml'}:/etc/glaring/codex.toml:ro"]
+    if spec.get("rig"):
+        rig = (ROOT / spec["rig"]).resolve()
+        if not rig.is_file():
+            raise Fail(f"pod {pod}: rig file {spec['rig']} not found")
+        extra += ["-v", f"{rig}:/rig/rig.yaml:ro"]
+    for host, target in spec["_mounts"]:
+        if not host.exists():
+            raise Fail(f"pod {pod}: mount source {host} does not exist")
+        extra += ["-v", f"{host}:{target}:ro"]
+
+    tmp = Path(tempfile.mkdtemp(prefix="glaring-env-"))
+    tmp.chmod(0o700)
+    envf = tmp / "env"
+    try:
+        envf.write_text("".join(f"{k}={v}\n" for k, v in env.items() if "\n" not in v))
+        envf.chmod(0o600)
+        run(["create", "--name", cname(pod), "--hostname", cname(pod), "--network", MESH, "--user", POD_UID,
+             "--read-only", "--tmpfs", "/tmp:rw,nosuid,nodev,size=512m", "--tmpfs", "/run:rw,nosuid,nodev,size=16m",
+             "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", str(spec["pids"]),
+             "--memory", spec["memory"], "--memory-swap", spec["memory"], "--cpus", str(spec["cpus"]),
+             "--init", "--restart", "no", "--log-driver", "json-file", "--log-opt", "max-size=10m", "--log-opt", "max-file=3",
+             "--env-file", str(envf),
+             "-v", f"{cname(pod)}-home:/home/pod", "-v", f"{cname(pod)}-ws:/workspace"] + extra + [spec["image"]])
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    run(["network", "connect", eg_net, cname(pod)])
+    run(["start", cname(pod)])
+    print(f"up   {pod}")
+
+
+# ------------------------------------------------------------------- commands
+def cmd_build(args):
+    run(["build", "-t", POD_IMAGE_DEFAULT, str(ROOT / "image")], capture=False)
+    run(["build", "-t", PROXY_IMAGE, str(ROOT / "proxy")], capture=False)
+
+
+def cmd_up(args):
+    pods = load_pods(args.pods, args.names)
+    envfile = args.env_file or (ROOT / ".env")
+    envvars = parse_env_file(envfile)
+    if args.env_file and not Path(args.env_file).exists():
+        raise Fail(f"env file {args.env_file} not found")
+    base = []
+    pol = ROOT / "policy" / "egress.yaml"
+    if pol.exists():
+        base = (load_yaml(pol.read_text()) or {}).get("allow") or []
+    profile = args.aws_profile or os.environ.get("AWS_PROFILE")
+    for name in pods:
+        up_pod(name, pods, envvars, profile, base)
+
+
+def cmd_down(args):
+    pods = load_pods(args.pods, args.names)
+    for name in pods:
+        for nm in (cname(name), egress_name(name)):
+            run(["rm", "-f", nm], check=False)
+        run(["network", "rm", f"{PREFIX}-eg-{name}"], check=False)
+        if args.purge:
+            run(["volume", "rm", f"{cname(name)}-home", f"{cname(name)}-ws"], check=False)
+            shutil.rmtree(STATE / "pods" / name, ignore_errors=True)
+        print(f"down {name}")
+    if not args.names:
+        run(["network", "rm", MESH], check=False)
+        run(["network", "rm", OUT], check=False)
+
+
+def cmd_status(args):
+    pods = load_pods(args.pods, args.names)
+    print(f"{'POD':16} {'STATE':10} {'EGRESS PROXY':14} DAEMON")
+    for name in pods:
+        st = run(["inspect", "-f", "{{.State.Status}}", cname(name)], check=False)
+        pr = run(["inspect", "-f", "{{.State.Status}}", egress_name(name)], check=False)
+        state = st.stdout.strip() if st.returncode == 0 else "absent"
+        daemon = "-"
+        if state == "running":
+            d = run(["exec", cname(name), "rig", "daemon", "status"], check=False)
+            daemon = (d.stdout.strip().splitlines() or ["?"])[-1][:60]
+        print(f"{name:16} {state:10} {(pr.stdout.strip() if pr.returncode == 0 else 'absent'):14} {daemon}")
+
+
+def cmd_logs(args):
+    target = egress_name(args.name) if args.proxy else cname(args.name)
+    os.execvp(DOCKER, [DOCKER, "logs"] + (["-f"] if args.follow else []) + ["--tail", str(args.tail), target])
+
+
+def cmd_exec(args):
+    tty = ["-it"] if sys.stdin.isatty() else ["-i"]
+    os.execvp(DOCKER, [DOCKER, "exec"] + tty + [cname(args.name)] + (args.cmd or ["bash"]))
+
+
+def cmd_login(args):
+    os.execvp(DOCKER, [DOCKER, "exec", "-it", cname(args.name), "codex", "login", "--device-auth"])
+
+
+def cmd_refresh_creds(args):
+    pods = load_pods(args.pods, args.names)
+    profile = args.aws_profile or os.environ.get("AWS_PROFILE")
+    for name, spec in pods.items():
+        cred = pod_dir(name) / "aws" / "credentials"
+        if spec["model"].get("provider") == "bedrock" and cred.exists():
+            if not profile:
+                raise Fail("pass --aws-profile or set AWS_PROFILE")
+            with open(cred, "w") as fh:  # truncate in place: the bind mount follows the same inode
+                fh.write(aws_credentials_text(profile))
+            print(f"refreshed {name}")
+
+
+def cmd_test(args):
+    os.execv("/bin/bash", ["/bin/bash", str(ROOT / "tests" / "escape.sh")] + (args.rest or []))
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="glaring", description=__doc__.split("\n")[0])
+    ap.add_argument("--pods", default=str(ROOT / "pods"), help="directory of pod specs (default: ./pods)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("build", help="build the pod and proxy images").set_defaults(fn=cmd_build)
+    for nm, fn, h in (("up", cmd_up, "create and start pods (recreates containers; volumes persist)"),
+                      ("down", cmd_down, "stop and remove pods"),
+                      ("status", cmd_status, "show pod, proxy and daemon state"),
+                      ("refresh-creds", cmd_refresh_creds, "re-export short-lived AWS keys into running Bedrock pods")):
+        p = sub.add_parser(nm, help=h)
+        p.add_argument("names", nargs="*", help="pod names (default: all)")
+        if nm in ("up", "refresh-creds"):
+            p.add_argument("--aws-profile", help="AWS profile to export short-lived credentials from (Bedrock pods)")
+        if nm == "up":
+            p.add_argument("--env-file", help="env file with scoped tokens (default: ./.env if present)")
+        if nm == "down":
+            p.add_argument("--purge", action="store_true", help="also delete the pod volumes (workspace, home)")
+        p.set_defaults(fn=fn)
+    p = sub.add_parser("logs", help="container logs (kept outside the pod)")
+    p.add_argument("name"); p.add_argument("--proxy", action="store_true", help="egress proxy access log")
+    p.add_argument("-f", "--follow", action="store_true"); p.add_argument("--tail", type=int, default=100)
+    p.set_defaults(fn=cmd_logs)
+    p = sub.add_parser("exec", help="run a command in a pod (default: bash)")
+    p.add_argument("name"); p.add_argument("cmd", nargs="*"); p.set_defaults(fn=cmd_exec)
+    p = sub.add_parser("login", help="interactive Codex device login inside a pod (home setups)")
+    p.add_argument("name"); p.set_defaults(fn=cmd_login)
+    p = sub.add_parser("test", help="run the escape/exfil tests against the running example pods")
+    p.add_argument("rest", nargs="*"); p.set_defaults(fn=cmd_test)
+    args = ap.parse_args()
+    try:
+        args.fn(args)
+    except Fail as e:
+        print(f"glaring: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

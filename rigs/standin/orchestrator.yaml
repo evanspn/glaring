@@ -1,0 +1,13 @@
+version: "0.2"
+name: orchestrator
+summary: glaring pod rig with a single seat
+pods:
+  - id: orchestrator
+    label: orchestrator
+    members:
+      - id: worker
+        agent_ref: "builtin:terminal"
+        runtime: terminal
+        profile: none
+        cwd: /workspace
+    edges: []

@@ -1,0 +1,13 @@
+version: "0.2"
+name: builder
+summary: glaring pod rig with a single seat
+pods:
+  - id: builder
+    label: builder
+    members:
+      - id: worker
+        agent_ref: "builtin:terminal"
+        runtime: terminal
+        profile: none
+        cwd: /workspace
+    edges: []

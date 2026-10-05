@@ -1,0 +1,10 @@
+# A pod that should have nothing: no peers, no secrets, no model, no egress.
+name: intruder
+cpus: 1
+memory: 512m
+pids: 128
+model:
+  provider: none
+egress: []
+secrets: []
+peers: []

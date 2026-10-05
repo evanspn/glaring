@@ -1,0 +1,13 @@
+version: "0.2"
+name: qa
+summary: glaring pod rig with a single seat
+pods:
+  - id: qa
+    label: qa
+    members:
+      - id: worker
+        agent_ref: "builtin:terminal"
+        runtime: terminal
+        profile: none
+        cwd: /workspace
+    edges: []

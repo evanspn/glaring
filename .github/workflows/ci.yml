@@ -1,0 +1,41 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -m unittest tests.test_glaring -v
+      - name: shellcheck
+        run: shellcheck image/entrypoint.sh tests/escape.sh tests/e2e.sh scripts/harden-public-repo.sh
+  pods:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build images
+        run: ./glaring build
+      - name: Start the test pods (fake tokens only)
+        run: ./glaring --pods tests/pods up --env-file tests/test.env
+      - name: Wait for the daemons
+        run: |
+          for i in $(seq 1 30); do
+            ./glaring --pods tests/pods status | grep -c "Daemon running" | grep -qx 4 && exit 0
+            sleep 3
+          done
+          ./glaring --pods tests/pods status; exit 1
+      - name: Cross-pod queue e2e
+        run: ./tests/e2e.sh
+      - name: Escape and exfiltration tests
+        run: ./tests/escape.sh
+      - name: Pod logs on failure
+        if: failure()
+        run: for p in orchestrator builder qa intruder; do echo "== $p"; docker logs glaring-$p 2>&1 | tail -30; done
+      - name: Tear down
+        if: always()
+        run: ./glaring --pods tests/pods down --purge
