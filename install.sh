@@ -47,6 +47,12 @@ case "$action" in
     if [ -e "$link" ] && [ ! -L "$link" ]; then
       die "$link exists and is not a symlink; refusing to overwrite it"
     fi
+    if [ -L "$link" ]; then
+      case "$(readlink "$link")" in
+        */glaring) ;;
+        *) die "$link is a symlink to something other than a glaring clone; refusing to replace it" ;;
+      esac
+    fi
     ln -sfn "$here/glaring" "$link"
     echo "linked $link -> $here/glaring"
     case ":$PATH:" in
@@ -73,8 +79,21 @@ case "$action" in
       echo "no glaring link at $link"
     fi
     if [ "$purge" -eq 1 ]; then
+      state="${GLARING_STATE:-$HOME/.local/state/glaring}"
+      case "$state" in
+        /*) ;;
+        *) die "GLARING_STATE must be an absolute path (got: $state)" ;;
+      esac
+      case "$state" in
+        */../*|*/..|*/./*|*/.) die "refusing to purge state path containing . or .. components: $state" ;;
+      esac
+      [ "$(basename "$state")" = glaring ] || die "refusing to purge $state: its last component must be 'glaring'"
+      [ "$state" != "$HOME" ] && [ "$state" != "/" ] || die "refusing to purge $state"
+      if [ -d "$state" ] && [ ! -f "$state/tokens.json" ] && [ ! -d "$state/pods" ]; then
+        die "refusing to purge $state: it does not look like glaring state (no tokens.json or pods/)"
+      fi
       "$here/glaring" down --purge || true
-      rm -rf "${GLARING_STATE:-$HOME/.local/state/glaring}"
+      rm -rf -- "$state"
       echo "purged pods, volumes and glaring state"
     fi
     if [ "$images" -eq 1 ] || [ "$purge" -eq 1 ]; then

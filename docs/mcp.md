@@ -30,6 +30,8 @@ touching the repo or the image.
 | `npx`, `uvx`, `pip`, `sh -c`, `curl`, `docker`... as the command | can download or run arbitrary code at run time. Opt in per pod with `allow_runtime_install: true` (and allowlist a registry host) |
 | `cwd` must be inside the pod, no `..` | |
 
+The secret-literal and installer-command checks are hygiene that catches mistakes and obvious tricks, not a security boundary: an MCP server is code that runs with the pod's secrets, so only configure servers you trust. The boundary is the pod itself.
+
 ## Local stdio servers: bake them in
 
 Prefer a derived image with the server pre-installed, then use it in the pod spec:

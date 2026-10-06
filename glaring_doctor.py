@@ -239,7 +239,7 @@ def check_network(rep, os_name, hosts):
                 except Exception:  # noqa: BLE001
                     pass
         else:
-            rep.add(g, h, WARN, f"unreachable ({extra})", "check VPN/corporate proxy; for an offline install use install.sh --tarball")
+            rep.add(g, h, WARN, f"unreachable ({extra})", "check VPN/corporate proxy settings (skip network checks with --offline)")
     if skew is not None:
         rep.add(g, "Clock skew", PASS if skew < 120 else WARN, f"{skew:.0f}s vs server time",
                 None if skew < 120 else fix_for(os_name, "sudo sntp -sS time.apple.com", "sudo timedatectl set-ntp true") + "  (AWS signatures fail with a skewed clock)")

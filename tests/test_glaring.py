@@ -147,6 +147,29 @@ class McpConfig(unittest.TestCase):
             with self.assertRaises(g.Fail, msg=label):
                 self.run_toml(toml)
 
+    def test_literal_secrets_in_args_and_url_refused(self):
+        bad = {
+            "flag=value": '[mcp_servers.a]\ncommand = "node"\nargs = ["/opt/s.js", "--api-key=abc123"]',
+            "flag value": '[mcp_servers.a]\ncommand = "node"\nargs = ["/opt/s.js", "--token", "abc123"]',
+            "long token arg": '[mcp_servers.a]\ncommand = "node"\nargs = ["/opt/s.js", "' + "A1" * 20 + '"]',
+            "prefixed token arg": '[mcp_servers.a]\ncommand = "node"\nargs = ["/opt/s.js", "ghp_abcdefghijklmnop"]',
+            "url query key": '[mcp_servers.a]\nurl = "https://mcp.example.org/m?api_key=abc"',
+            "url query token": '[mcp_servers.a]\nurl = "https://mcp.example.org/m?x=' + "Z9" * 20 + '"',
+            "url path token": '[mcp_servers.a]\nurl = "https://mcp.example.org/' + "k3" * 20 + '/mcp"',
+            "url fragment": '[mcp_servers.a]\nurl = "https://mcp.example.org/m#frag"',
+        }
+        for label, toml in bad.items():
+            with self.assertRaises(g.Fail, msg=label):
+                self.run_toml(toml)
+        # ordinary args, paths and query strings still work
+        self.run_toml('[mcp_servers.a]\ncommand = "node"\nargs = ["/opt/mcp/some/very/long/path/to/server/entrypoint/index.js", "--stdio", "--region", "us-west-2"]\n'
+                      '[mcp_servers.b]\nurl = "https://mcp.example.org/v1/mcp?format=json"\n')
+
+    def test_toml_string_edge_cases(self):
+        self.assertEqual(g.toml_str("😀"), '"😀"')
+        self.assertNotIn("\x7f", g.toml_str("a\x7fb"))
+        self.assertEqual(g.toml_str('a"b\n'), '"a\\"b\\n"')
+
     def test_runtime_install_is_opt_in(self):
         toml = '[mcp_servers.a]\ncommand = "npx"\nargs=["-y","@x/y"]\n'
         self.run_toml(toml, "allow_runtime_install: true\n")

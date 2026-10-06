@@ -20,6 +20,20 @@ ln -s /bin/ls "$P/other/bin/glaring"
 if ./install.sh uninstall --prefix "$P/other" >/dev/null 2>&1; then fail "removed a foreign symlink"; fi
 [ -L "$P/other/bin/glaring" ] && ok "uninstall refuses a link that does not point at a glaring clone" || fail "foreign link removed"
 
+# --purge must not rm -rf an arbitrary GLARING_STATE
+mkdir -p "$P/precious"; echo keep > "$P/precious/file"
+for bad in "$P/precious" "$HOME" "/" "relative/glaring" "$P/precious/../glaring"; do
+  if GLARING_STATE="$bad" ./install.sh uninstall --purge --prefix "$P" >/dev/null 2>&1; then fail "purge accepted GLARING_STATE=$bad"; fi
+done
+[ -f "$P/precious/file" ] && ok "purge refuses unsafe GLARING_STATE values" || fail "purge deleted a non-glaring dir"
+mkdir -p "$P/x/glaring"; echo keep > "$P/x/glaring/file"
+if GLARING_STATE="$P/x/glaring" ./install.sh uninstall --purge --prefix "$P" >/dev/null 2>&1; then fail "purged a dir that is not glaring state"; fi
+[ -f "$P/x/glaring/file" ] && ok "purge refuses a directory that does not look like glaring state" || fail "unmarked dir deleted"
+
+ln -sfn /bin/ls "$P/other/bin/glaring"
+if ./install.sh --prefix "$P/other" --no-doctor >/dev/null 2>&1; then fail "install replaced a foreign symlink"; fi
+ok "install refuses to replace a symlink that points elsewhere"
+
 ./install.sh uninstall --prefix "$P" >/dev/null
 [ ! -e "$P/bin/glaring" ] && ok "uninstall removes the link" || fail "link remains"
 [ -x ./glaring ] && ok "the clone itself is untouched" || fail "clone damaged"

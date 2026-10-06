@@ -291,7 +291,10 @@ def validate_model(model, where="model"):
 
 
 def toml_str(v):
-    return json.dumps(str(v))  # a JSON string is a valid TOML basic string
+    # A JSON string is a valid TOML basic string, except: JSON would emit
+    # non-BMP characters as surrogate-pair escapes (invalid TOML), and leaves
+    # DEL (0x7f) raw (not allowed in TOML).
+    return json.dumps(str(v), ensure_ascii=False).replace("\x7f", "\\u007f")
 
 
 def model_hosts(model):
@@ -367,6 +370,42 @@ def _load_toml(path):
         raise Fail(f"{path}: cannot parse TOML: {e}")
 
 
+SECRET_FLAG_RE = re.compile(r"(?i)^--?[a-z0-9_-]*(token|key|secret|password|passwd|credential|auth|bearer|sig(nature)?)[a-z0-9_-]*$")
+SECRET_PARAM_RE = re.compile(r"(?i)(token|key|secret|password|passwd|credential|auth|bearer|sig|signature)")
+TOKENISH_RE = re.compile(r"[A-Za-z0-9+_=-]{32,}")
+KNOWN_PREFIX_RE = re.compile(r"(?i)(bearer\s+\S{8,}|(sk|pk|ghp|gho|ghs|xox[bap]|AKIA|ASIA)[-_A-Za-z0-9]{12,})")
+
+
+def _looks_secret_value(v):
+    if v.startswith("/"):  # a path: only known token prefixes count
+        return bool(KNOWN_PREFIX_RE.search(v))
+    return bool(KNOWN_PREFIX_RE.search(v) or TOKENISH_RE.search(v))
+
+
+def check_args_for_secrets(args, where):
+    for i, a in enumerate(args):
+        if "=" in a and a.startswith("-"):
+            flag, val = a.split("=", 1)
+            if SECRET_FLAG_RE.match(flag) and val:
+                raise Fail(f"{where}: arg {flag}=... carries a literal secret; pass it through env_vars instead")
+        elif SECRET_FLAG_RE.match(a) and i + 1 < len(args) and not args[i + 1].startswith("-"):
+            raise Fail(f"{where}: {a} is followed by a literal value; pass secrets through env_vars instead")
+        if _looks_secret_value(a):
+            raise Fail(f"{where}: arg looks like a literal secret; pass it through env_vars instead")
+
+
+def check_url_for_secrets(u, where):
+    if u.fragment:
+        raise Fail(f"{where}: url fragments are not allowed")
+    for pair in filter(None, u.query.split("&")):
+        name, _, val = pair.partition("=")
+        if (SECRET_PARAM_RE.search(name) and val) or _looks_secret_value(val):
+            raise Fail(f"{where}: url query carries a literal secret ({name}); use bearer_token_env_var or env_http_headers")
+    for seg in u.path.split("/"):
+        if _looks_secret_value(seg):
+            raise Fail(f"{where}: url path segment looks like a literal secret; use an env-var header instead")
+
+
 def _declared(name, secrets_list, where):
     if not isinstance(name, str) or not SECRET_RE.match(name):
         raise Fail(f"{where}: {name!r} is not an environment variable name")
@@ -414,6 +453,8 @@ def validate_codex_config(data, spec, where):
                 if k == "env_vars":
                     for n in v:
                         _declared(n, spec["secrets"], f"{w}.env_vars")
+                if k == "args":
+                    check_args_for_secrets(v, f"{w}.args")
             elif k == "bearer_token_env_var":
                 _declared(v, spec["secrets"], f"{w}.{k}")
             elif k == "env_http_headers":
@@ -451,6 +492,7 @@ def validate_codex_config(data, spec, where):
                 if u.scheme != "https" or not u.hostname or u.username or u.password or u.port not in (None, 443):
                     raise Fail(f"{w}.url must be https://host/... (no credentials, default port)")
                 check_host(u.hostname, f"{w}.url", allow_wildcard=False)
+                check_url_for_secrets(u, f"{w}.url")
                 if u.hostname not in egress:
                     warnings.append(f"{w}: host {u.hostname} is not in this pod's egress: list, so the proxy will block it")
             out[k] = v
