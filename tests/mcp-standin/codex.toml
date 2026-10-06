@@ -1,0 +1,9 @@
+# Test config: placeholder servers, no real values.
+[mcp_servers.standin]
+command = "node"
+args = ["/opt/mcp/server.js"]
+env_vars = ["MCP_TEST_KEY"]
+
+[mcp_servers.remote]
+url = "https://mcp.example.org/mcp"
+bearer_token_env_var = "MCP_TEST_KEY"

@@ -28,6 +28,20 @@ DOCKER = os.environ.get("GLARING_DOCKER", "docker")
 POD_UID = "10001:10001"
 
 
+def default_pods_dir():
+    """./pods in the current directory (your own specs) wins over the bundled examples."""
+    return str(Path.cwd() / "pods") if (Path.cwd() / "pods").is_dir() else str(ROOT / "pods")
+
+
+def default_env_file(explicit=None):
+    if explicit:
+        return Path(explicit)
+    for cand in (os.environ.get("GLARING_ENV"), Path.cwd() / ".env", ROOT / ".env"):
+        if cand and Path(cand).is_file():
+            return Path(cand)
+    return Path.cwd() / ".env"
+
+
 class Fail(Exception):
     pass
 
@@ -206,7 +220,7 @@ def load_pod(path):
             raise Fail(f"{path}: mount {m!r} must be 'host_path:/container/path' (always read-only)")
         host = Path(parts[0]).expanduser()
         if not host.is_absolute():
-            host = Path(path).resolve().parent.parent / host
+            host = ROOT / host
         mounts.append((check_mount_source(host, path), parts[1]))
     spec["_mounts"] = mounts
     model = spec.get("model") or {"provider": "none"}
@@ -214,6 +228,15 @@ def load_pod(path):
         raise Fail(f"{path}: model.provider must be one of {PROVIDERS}")
     validate_model(model, f"{path}: model")
     spec["model"] = model
+    spec["_warnings"] = []
+    spec["_mcp"] = {}
+    if spec.get("codex_config"):
+        raw = Path(str(spec["codex_config"])).expanduser()
+        cfg = Path(os.path.realpath(raw if raw.is_absolute() else ROOT / raw))
+        check_mount_source(cfg, path)
+        if not cfg.is_file() or cfg.stat().st_size > 64 * 1024:
+            raise Fail(f"{path}: codex_config must be a regular file under 64 KB")
+        spec["_mcp"], spec["_warnings"] = validate_codex_config(_load_toml(cfg), spec, f"{path}: codex_config")
     if spec.get("rig"):
         rig = Path(os.path.realpath(ROOT / str(spec["rig"])))
         rigs_root = Path(os.path.realpath(ROOT / "rigs"))
@@ -314,6 +337,156 @@ def codex_toml(model):
             'wire_api = "responses"',
         ]
     return "\n".join(lines) + "\n" if prov != "none" else None
+
+
+
+# ------------------------------------------------------------------ MCP / Codex TOML
+MCP_STDIO_KEYS = {"command", "args", "env", "env_vars", "cwd", "startup_timeout_sec", "tool_timeout_sec", "enabled",
+                  "required", "enabled_tools", "disabled_tools", "default_tools_approval_mode"}
+MCP_HTTP_KEYS = {"url", "bearer_token_env_var", "http_headers", "env_http_headers", "startup_timeout_sec",
+                 "tool_timeout_sec", "enabled", "required", "enabled_tools", "disabled_tools", "default_tools_approval_mode"}
+MCP_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
+INSTALLERS = {"npx", "uvx", "pipx", "pip", "pip3", "npm", "pnpm", "yarn", "bunx", "bun", "deno", "curl", "wget", "sh",
+              "bash", "zsh", "dash", "python", "python3", "node", "docker", "podman", "sudo", "su", "env", "eval", "perl", "ruby"}
+RUNTIMES_ALLOWED_WITH_SCRIPT = {"node", "python3", "python"}
+SECRETISH_KEY_RE = re.compile(r"(TOKEN|KEY|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH)", re.I)
+SECRET_VALUE_RE = re.compile(r"(?i)(bearer\s+\S{8,}|[A-Za-z0-9+/_-]{32,}|(sk|pk|ghp|gho|ghs|xox[bap]|AKIA|ASIA)[-_A-Za-z0-9]{12,})")
+POD_PATH_PREFIXES = ("/workspace/", "/home/pod/", "/opt/", "/usr/local/bin/", "/usr/bin/", "/rig/")
+TOP_LEVEL_DENIED_HINT = ("glaring owns model, provider, sandbox, approvals and hooks; "
+                         "a codex_config file may only contribute [mcp_servers.*]")
+
+
+def _load_toml(path):
+    try:
+        import tomllib
+    except ImportError:
+        raise Fail("codex_config needs Python 3.11+ (stdlib tomllib) to validate the TOML safely")
+    try:
+        return tomllib.loads(Path(path).read_text())
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        raise Fail(f"{path}: cannot parse TOML: {e}")
+
+
+def _declared(name, secrets_list, where):
+    if not isinstance(name, str) or not SECRET_RE.match(name):
+        raise Fail(f"{where}: {name!r} is not an environment variable name")
+    if name not in secrets_list:
+        raise Fail(f"{where}: references ${name}, which this pod did not declare under secrets:")
+
+
+def validate_codex_config(data, spec, where):
+    """Return (servers, warnings). Only [mcp_servers.*] is accepted; anything that
+    could weaken the boundary or clobber glaring's own provider config is refused."""
+    extra = sorted(set(data) - {"mcp_servers"})
+    if extra:
+        raise Fail(f"{where}: top-level key(s) {extra} not allowed; {TOP_LEVEL_DENIED_HINT}")
+    servers = data.get("mcp_servers") or {}
+    if not isinstance(servers, dict):
+        raise Fail(f"{where}: mcp_servers must be a table of servers")
+    allow_install = bool(spec.get("allow_runtime_install"))
+    egress = set(h.lstrip(".") for h in spec["egress"]) | set(model_hosts(spec["model"]))
+    warnings = []
+    clean = {}
+    for name, srv in servers.items():
+        w = f"{where}: mcp_servers.{name}"
+        if not MCP_NAME_RE.match(name) or not isinstance(srv, dict):
+            raise Fail(f"{w}: bad server name or shape")
+        is_http = "url" in srv
+        is_stdio = "command" in srv
+        if is_http == is_stdio:
+            raise Fail(f"{w}: exactly one of 'command' (stdio) or 'url' (HTTP) is required")
+        allowed = MCP_HTTP_KEYS if is_http else MCP_STDIO_KEYS
+        bad = sorted(set(srv) - allowed)
+        if bad:
+            hint = " (interactive auth is not supported in pods)" if "auth" in bad else ""
+            raise Fail(f"{w}: unsupported key(s) {bad}{hint}")
+        out = {}
+        for k, v in srv.items():
+            if k in ("startup_timeout_sec", "tool_timeout_sec"):
+                if not isinstance(v, int) or isinstance(v, bool) or not 1 <= v <= 3600:
+                    raise Fail(f"{w}.{k}: integer 1..3600")
+            elif k in ("enabled", "required"):
+                if not isinstance(v, bool):
+                    raise Fail(f"{w}.{k}: boolean")
+            elif k in ("args", "enabled_tools", "disabled_tools", "env_vars"):
+                if not isinstance(v, list) or not all(isinstance(x, str) and "\n" not in x for x in v):
+                    raise Fail(f"{w}.{k}: list of strings")
+                if k == "env_vars":
+                    for n in v:
+                        _declared(n, spec["secrets"], f"{w}.env_vars")
+            elif k == "bearer_token_env_var":
+                _declared(v, spec["secrets"], f"{w}.{k}")
+            elif k == "env_http_headers":
+                if not isinstance(v, dict):
+                    raise Fail(f"{w}.{k}: table of header = VAR_NAME")
+                for hname, var in v.items():
+                    if not re.fullmatch(r"[A-Za-z0-9-]+", hname):
+                        raise Fail(f"{w}.{k}: bad header name {hname!r}")
+                    _declared(var, spec["secrets"], f"{w}.{k}.{hname}")
+            elif k in ("env", "http_headers"):
+                if not isinstance(v, dict) or not all(isinstance(x, str) for x in v.values()):
+                    raise Fail(f"{w}.{k}: table of strings")
+                for ek, ev in v.items():
+                    if (SECRETISH_KEY_RE.search(ek) and ev) or SECRET_VALUE_RE.search(ev):
+                        ref = "env_vars / bearer_token_env_var / env_http_headers"
+                        raise Fail(f"{w}.{k}.{ek}: looks like a literal secret; reference an env var instead ({ref})")
+            elif k == "default_tools_approval_mode":
+                if v not in ("auto", "prompt", "approve"):
+                    raise Fail(f"{w}.{k}: auto | prompt | approve")
+            elif k == "cwd":
+                if not isinstance(v, str) or ".." in v.split("/") or not v.startswith(POD_PATH_PREFIXES + ("/workspace",)):
+                    raise Fail(f"{w}.cwd must be an absolute path inside the pod (/workspace, /home/pod, /opt)")
+            elif k == "command":
+                if not isinstance(v, str) or not v or "\n" in v or ".." in v.split("/"):
+                    raise Fail(f"{w}.command: invalid")
+                base = v.rsplit("/", 1)[-1]
+                if v.startswith("/") and not v.startswith(POD_PATH_PREFIXES):
+                    raise Fail(f"{w}.command: absolute path must be inside the pod ({', '.join(POD_PATH_PREFIXES)})")
+                if base in INSTALLERS and not (allow_install or (base in RUNTIMES_ALLOWED_WITH_SCRIPT and srv.get("args")
+                                               and str(srv["args"][0]).startswith(POD_PATH_PREFIXES) and not str(srv["args"][0]).startswith("-"))):
+                    raise Fail(f"{w}.command: '{base}' can download or run arbitrary code. Bake the server into a derived "
+                               "image (docs/mcp.md) or set allow_runtime_install: true in the pod spec")
+            elif k == "url":
+                u = urlsplit(str(v))
+                if u.scheme != "https" or not u.hostname or u.username or u.password or u.port not in (None, 443):
+                    raise Fail(f"{w}.url must be https://host/... (no credentials, default port)")
+                check_host(u.hostname, f"{w}.url", allow_wildcard=False)
+                if u.hostname not in egress:
+                    warnings.append(f"{w}: host {u.hostname} is not in this pod's egress: list, so the proxy will block it")
+            out[k] = v
+        if allow_install and is_stdio and srv["command"].rsplit("/", 1)[-1] in INSTALLERS:
+            if not ({"registry.npmjs.org", "pypi.org", "files.pythonhosted.org"} & egress):
+                warnings.append(f"{w}: runtime install needs a registry host in egress: (e.g. registry.npmjs.org)")
+        clean[name] = out
+    return clean, warnings
+
+
+def _toml_val(v):
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, str):
+        return toml_str(v)
+    if isinstance(v, list):
+        return "[" + ", ".join(_toml_val(x) for x in v) + "]"
+    raise Fail("unsupported TOML value")
+
+
+def render_mcp(servers):
+    """Re-render validated servers ourselves; the user's raw text is never copied."""
+    out = []
+    for name, srv in servers.items():
+        out += ["", f"[mcp_servers.{name}]"]
+        tables = {}
+        for k, v in srv.items():
+            if isinstance(v, dict):
+                tables[k] = v
+            else:
+                out.append(f"{k} = {_toml_val(v)}")
+        for k, tbl in tables.items():
+            out += ["", f"[mcp_servers.{name}.{k}]"] + [f"{toml_str(a) if not re.fullmatch(r'[A-Za-z0-9_-]+', a) else a} = {_toml_val(b)}" for a, b in tbl.items()]
+    return "\n".join(out) + "\n" if out else ""
 
 
 def aws_credentials_text(profile):
@@ -430,6 +603,8 @@ def up_pod(pod, pods, envfile_vars, aws_profile, base_allow):
     (d / "squid.conf").write_text(squid_conf(hosts))
     (d / "squid.conf").chmod(0o644)
     toml = codex_toml(model)
+    if spec.get("_mcp"):
+        toml = (toml or "") + render_mcp(spec["_mcp"])
     if toml:
         (d / "codex.toml").write_text(toml)
         (d / "codex.toml").chmod(0o644)
@@ -518,7 +693,7 @@ def cmd_build(args):
 
 def cmd_up(args):
     pods = load_pods(args.pods, args.names)
-    envfile = args.env_file or (ROOT / ".env")
+    envfile = default_env_file(args.env_file)
     envvars = parse_env_file(envfile)
     if args.env_file and not Path(args.env_file).exists():
         raise Fail(f"env file {args.env_file} not found")
@@ -528,6 +703,8 @@ def cmd_up(args):
         base = (load_yaml(pol.read_text()) or {}).get("allow") or []
     profile = args.aws_profile or os.environ.get("AWS_PROFILE")
     for name in pods:
+        for w in pods[name]["_warnings"]:
+            print(f"warning: {w}", file=sys.stderr)
         up_pod(name, pods, envvars, profile, base)
 
 
@@ -587,13 +764,27 @@ def cmd_refresh_creds(args):
             print(f"refreshed {name}")
 
 
+def cmd_doctor(args):
+    sys.path.insert(0, str(ROOT))
+    import glaring_doctor as d
+    rep, os_name = d.run_doctor(ROOT, default_env_file(args.env_file), args.pods, load_pods,
+                                profile=args.aws_profile or os.environ.get("AWS_PROFILE"), offline=args.offline)
+    if args.json:
+        print(d.to_json(rep, os_name))
+    else:
+        color = sys.stdout.isatty() and "NO_COLOR" not in os.environ
+        uni = (sys.stdout.encoding or "").lower().startswith("utf")
+        print(d.render(rep, color, uni, args.fix))
+    sys.exit(1 if rep.counts()[d.FAIL] else 0)
+
+
 def cmd_test(args):
     os.execv("/bin/bash", ["/bin/bash", str(ROOT / "tests" / "escape.sh")] + (args.rest or []))
 
 
 def main():
     ap = argparse.ArgumentParser(prog="glaring", description=__doc__.split("\n")[0])
-    ap.add_argument("--pods", default=str(ROOT / "pods"), help="directory of pod specs (default: ./pods)")
+    ap.add_argument("--pods", default=default_pods_dir(), help="directory of pod specs (default: ./pods if present, else the bundled examples)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("build", help="build the pod and proxy images").set_defaults(fn=cmd_build)
     for nm, fn, h in (("up", cmd_up, "create and start pods (recreates containers; volumes persist)"),
@@ -609,6 +800,13 @@ def main():
         if nm == "down":
             p.add_argument("--purge", action="store_true", help="also delete the pod volumes (workspace, home)")
         p.set_defaults(fn=fn)
+    p = sub.add_parser("doctor", help="check dependencies and environment (read-only)")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    p.add_argument("--fix", action="store_true", help="also print a consolidated fix list")
+    p.add_argument("--aws-profile", help="validate this AWS profile (Bedrock pods)")
+    p.add_argument("--env-file", help="env file to check (default: ./.env)")
+    p.add_argument("--offline", action="store_true", help="skip network reachability checks")
+    p.set_defaults(fn=cmd_doctor)
     p = sub.add_parser("logs", help="container logs (kept outside the pod)")
     p.add_argument("name"); p.add_argument("--proxy", action="store_true", help="egress proxy access log")
     p.add_argument("-f", "--follow", action="store_true"); p.add_argument("--tail", type=int, default=100)

@@ -24,6 +24,8 @@ Read [SECURITY.md](SECURITY.md) for what this does and does not protect.
 
 | Piece | State |
 | --- | --- |
+| `glaring doctor` (dependency check), `install.sh` (clone-and-install) | Verified on macOS (Colima) with real output; install tests run in CI on Linux |
+| MCP servers + Codex config TOML into a pod, keys via env vars | Verified with a **stand-in** stdio server and a fake key (arrives in the right pod only, in no log). **Real MCP servers: assumed, unverified.** |
 | Pods as containers, each with its own daemon, paired by queue rows | Verified (Colima on macOS, and in CI on Linux) |
 | Cross-pod task: orchestrator -> builder -> qa -> orchestrator | Verified by `tests/e2e.sh` with terminal stand-in seats |
 | Hardening and escape/exfil tests (150+ checks) | Verified, in CI |
@@ -47,6 +49,10 @@ git clone https://github.com/evanspn/glaring && cd glaring
 
 # 1. container runtime (macOS example; skip if Docker already works)
 brew install colima docker && colima start --cpu 4 --memory 6
+
+# 1b. put `glaring` on your PATH (links this clone; downloads nothing, no sudo) and check your setup
+./install.sh            # then: export PATH="$HOME/.local/bin:$PATH" if it tells you to
+glaring doctor --fix    # says exactly what is missing and how to fix it, per OS
 
 # 2. scoped tokens, loaded at run time only (.env is gitignored AND dockerignored)
 cp .env.example .env && $EDITOR .env      # GITHUB_TOKEN, JIRA_API_TOKEN, ...
@@ -90,12 +96,37 @@ model:
   env_key: MY_LLM_KEY       # list MY_LLM_KEY under secrets:
 ```
 
+## `glaring doctor`
+
+Read-only dependency check: container runtime installed/running/version, VM or
+rootless isolation, seccomp, CPUs/memory/disk, images, pod specs, env file
+(variable **names** only, never values), AWS CLI and profile validity for
+Bedrock pods (short-lived keys required; nothing secret is printed), network
+reachability, clock skew. `--json` for machines, `--fix` for a consolidated
+fix list, `--offline` to skip network checks. Exit code 1 if anything failed.
+
+## Install / uninstall (clone-and-install)
+
+`./install.sh` links `~/.local/bin/glaring` to your clone (so `git pull`
+upgrades it), runs doctor, and with `--build` builds the images. It downloads
+nothing and never uses sudo. `./install.sh uninstall` removes only that link
+(`--images` also removes the images; `--purge` also deletes pod volumes and state).
+
+## MCP servers and a Codex config
+
+Point a pod at a TOML that holds only `[mcp_servers.*]`; keys are referenced by
+env var NAME and the values come from `.env`, only for pods that declare them.
+See [docs/mcp.md](docs/mcp.md) and `configs/codex.example.toml`. Real MCP
+servers are assumed to work as Codex documents; only the stand-in is tested.
+
 ## Verify it yourself
 
 ```sh
 ./glaring --pods tests/pods up --env-file tests/test.env   # 4 throwaway pods, fake tokens
 ./tests/e2e.sh        # a task crosses 3 pod boundaries as queue rows
 ./tests/escape.sh     # 150+ escape/exfiltration checks; exit code = failures
+./tests/mcp.sh        # stand-in MCP server + env-var key: arrives, isolated, never logged
+./tests/install_test.sh
 python3 -m unittest tests.test_glaring
 ./glaring --pods tests/pods down --purge
 ```
@@ -113,7 +144,9 @@ A pod is one small YAML file in `pods/` (a strict YAML subset: maps, lists of sc
 | `egress` | extra allowed hostnames (HTTPS only; a leading dot allows subdomains) |
 | `secrets` | names from the env file this pod may receive |
 | `peers` | pods this pod is paired with (it gets only their bearer tokens) |
-| `mounts` | explicit read-only host mounts `host_path:/in/pod` (your home or `/` is refused) |
+| `mounts` | explicit read-only host mounts `host_path:/in/pod` (relative paths are from the repo; your home, `/`, sockets and credential dirs are refused) |
+| `codex_config` | a TOML with `[mcp_servers.*]` only (see docs/mcp.md); env vars it names must be in `secrets` |
+| `allow_runtime_install` | opt in to `npx`/`uvx`-style MCP servers that download code at run time (default: refused) |
 
 `policy/egress.yaml` adds hosts for every pod (empty by default).
 `rigs/example/` has one Codex seat per pod; `rigs/standin/` has terminal seats used by the tests.

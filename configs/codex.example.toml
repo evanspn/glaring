@@ -1,0 +1,18 @@
+# Example Codex config for a glaring pod. Copy to configs/mine.toml (gitignored),
+# then point a pod at it:   codex_config: configs/mine.toml
+#
+# Only [mcp_servers.*] is accepted; glaring owns the model, provider, sandbox
+# and hooks. API keys NEVER go in this file: name the environment variable,
+# list that name under `secrets:` in the pod spec, and put the value in .env.
+
+# A remote (streamable HTTP) MCP server. Add its host to the pod's `egress:`.
+[mcp_servers.example-remote]
+url = "https://mcp.example.com/mcp"
+bearer_token_env_var = "EXAMPLE_MCP_TOKEN"     # a NAME; value comes from .env
+# env_http_headers = { "X-Api-Key" = "EXAMPLE_MCP_KEY" }
+
+# A local stdio MCP server that is already inside the pod image (see docs/mcp.md).
+[mcp_servers.example-local]
+command = "/opt/mcp/bin/example-server"
+args = ["--stdio"]
+env_vars = ["EXAMPLE_MCP_TOKEN"]               # names only

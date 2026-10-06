@@ -7,5 +7,8 @@ model:
   provider: openai
 egress:
   - api.github.com
-secrets: [GITHUB_TOKEN]
+  - mcp.example.org
+secrets: [GITHUB_TOKEN, MCP_TEST_KEY]
+codex_config: tests/mcp-standin/codex.toml
+mounts: ['tests/mcp-standin:/opt/mcp']
 peers: [orchestrator, qa]

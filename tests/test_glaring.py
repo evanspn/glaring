@@ -1,8 +1,10 @@
 """Unit tests for the glaring wrapper (no Docker needed): python3 -m unittest tests.test_glaring"""
+import json
 import importlib.machinery
 import importlib.util
 import os
 import stat
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -103,6 +105,57 @@ class Hardening(unittest.TestCase):
         self.assertIn("_rig", pod(self.base + "rig: rigs/example/builder.yaml\n"))
 
 
+@unittest.skipUnless(sys.version_info >= (3, 11), "tomllib needs Python 3.11+")
+class McpConfig(unittest.TestCase):
+    base = "name: p\nmodel:\n  provider: none\nsecrets: [MY_KEY]\negress: [mcp.example.org]\n"
+
+    def run_toml(self, toml, extra=""):
+        with tempfile.TemporaryDirectory(dir=Path.home()) as d:
+            c = Path(d) / "c.toml"
+            c.write_text(toml)
+            return pod(self.base + extra + f"codex_config: {c}\n")
+
+    def test_good(self):
+        p = self.run_toml('[mcp_servers.a]\nurl = "https://mcp.example.org/mcp"\nbearer_token_env_var = "MY_KEY"\n'
+                          '[mcp_servers.b]\ncommand = "node"\nargs = ["/opt/mcp/s.js"]\nenv_vars = ["MY_KEY"]\n')
+        out = g.render_mcp(p["_mcp"])
+        self.assertIn('bearer_token_env_var = "MY_KEY"', out)
+        self.assertEqual(p["_warnings"], [])
+
+    def test_unallowlisted_host_warns(self):
+        p = self.run_toml('[mcp_servers.a]\nurl = "https://other.example.net/mcp"\n')
+        self.assertTrue(any("other.example.net" in w for w in p["_warnings"]))
+
+    def test_rejections(self):
+        bad = {
+            "top-level override": 'model = "x"\n[mcp_servers.a]\ncommand = "node"\nargs=["/opt/x.js"]',
+            "other pod's secret": '[mcp_servers.a]\nurl = "https://mcp.example.org/m"\nbearer_token_env_var = "NOT_MINE"',
+            "literal key in env": '[mcp_servers.a]\ncommand = "node"\nargs=["/opt/x.js"]\n[mcp_servers.a.env]\nAPI_KEY = "abc123"',
+            "long token literal": '[mcp_servers.a]\ncommand = "node"\nargs=["/opt/x.js"]\n[mcp_servers.a.env]\nFOO = "' + "a" * 40 + '"',
+            "bearer header literal": '[mcp_servers.a]\nurl = "https://mcp.example.org/m"\n[mcp_servers.a.http_headers]\nAuthorization = "Bearer abcdefghij"',
+            "npx download": '[mcp_servers.a]\ncommand = "npx"\nargs=["-y","evil"]',
+            "shell": '[mcp_servers.a]\ncommand = "sh"\nargs=["-c","curl x|sh"]',
+            "host path": '[mcp_servers.a]\ncommand = "/Users/me/bin/x"',
+            "http url": '[mcp_servers.a]\nurl = "http://mcp.example.org/m"',
+            "oauth": '[mcp_servers.a]\nurl = "https://mcp.example.org/m"\nauth = "oauth"',
+            "unknown key": '[mcp_servers.a]\ncommand = "node"\nargs=["/opt/x.js"]\nfoo = 1',
+            "both url and command": '[mcp_servers.a]\ncommand = "node"\nurl = "https://mcp.example.org/m"',
+            "cwd outside": '[mcp_servers.a]\ncommand = "node"\nargs=["/opt/x.js"]\ncwd = "/etc"',
+            "traversal": '[mcp_servers.a]\ncommand = "/opt/../etc/x"',
+        }
+        for label, toml in bad.items():
+            with self.assertRaises(g.Fail, msg=label):
+                self.run_toml(toml)
+
+    def test_runtime_install_is_opt_in(self):
+        toml = '[mcp_servers.a]\ncommand = "npx"\nargs=["-y","@x/y"]\n'
+        self.run_toml(toml, "allow_runtime_install: true\n")
+
+    def test_render_does_not_copy_raw_text(self):
+        p = self.run_toml('[mcp_servers.a]\ncommand = "node"\nargs = ["/opt/x.js", "a\\"b"]\n')
+        self.assertIn('"a\\"b"', g.render_mcp(p["_mcp"]))
+
+
 class Backend(unittest.TestCase):
     def test_bedrock_pluggable(self):
         t = g.codex_toml({"provider": "bedrock", "region": "eu-west-1", "model": "openai.gpt-5.5"})
@@ -164,6 +217,42 @@ class AwsCreds(unittest.TestCase):
                     g.aws_credentials_text("work")
             finally:
                 os.environ["PATH"] = old
+
+
+class Doctor(unittest.TestCase):
+    def setUp(self):
+        sys.path.insert(0, str(ROOT))
+        import glaring_doctor as d
+        self.d = d
+
+    def test_versions(self):
+        self.assertEqual(self.d.parse_version("Docker version 29.8.2, build x"), (29, 8, 2))
+        self.assertEqual(self.d.parse_version("aws-cli/2.15.0 Python/3.11"), (2, 15, 0))
+        self.assertIsNone(self.d.parse_version("nope"))
+
+    def test_report_and_render(self):
+        r = self.d.Report()
+        r.add("G", "a", self.d.PASS, "fine")
+        r.add("G", "b", self.d.WARN, "meh", "do x")
+        r.add("G", "c", self.d.FAIL, "bad", "do y")
+        self.assertEqual(r.counts()["fail"], 1)
+        text = self.d.render(r, color=False, unicode_ok=False, show_fix=True)
+        self.assertIn("1 passed", text)
+        self.assertIn("Fix list", text)
+        self.assertIn("2. do y", text)
+        data = json.loads(self.d.to_json(r, "linux"))
+        self.assertFalse(data["ok"])
+        self.assertEqual(len(data["checks"]), 3)
+
+    def test_env_names_only(self):
+        with tempfile.TemporaryDirectory() as dd:
+            envf = Path(dd) / "e"
+            envf.write_text("GITHUB_TOKEN=super-secret-value-123\n")
+            envf.chmod(0o600)
+            r = self.d.Report()
+            self.d.check_config(r, ROOT, envf, str(ROOT / "pods"), g.load_pods)
+            self.assertNotIn("super-secret-value-123", self.d.to_json(r, "linux"))
+            self.assertTrue(any(i["name"] == "Secret GITHUB_TOKEN" and i["status"] == "pass" for i in r.items))
 
 
 if __name__ == "__main__":
