@@ -17,6 +17,8 @@ secrets: [OPENROUTER_API_KEY]
   no budget setting of its own; the key's limit is the only spend guard.
 - Only `openrouter.ai` is allowlisted for that pod (derived from `base_url`).
 
+**Data leaves the machine.** Everything the pod's agent reads (workspace files, tool output, the task text) is sent to OpenRouter and on to the upstream model provider, who may log it. Do not point such a pod at private or sensitive data, and turn off prompt logging in OpenRouter's privacy settings.
+
 **Status: assumed, unverified.** The config renders and validates in tests, but no
 request to OpenRouter was made. Codex talks the OpenAI *Responses* wire protocol
 (`wire_api = "responses"`), and whether a given OpenRouter model works with Codex
