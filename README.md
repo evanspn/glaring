@@ -96,6 +96,12 @@ model:
   env_key: MY_LLM_KEY       # list MY_LLM_KEY under secrets:
 ```
 
+## Overflow on OpenRouter
+
+A pod can use OpenRouter (or any OpenAI-compatible endpoint) as its model backend, for
+overflow when a plan-limited agent is blocked: see `examples/pods/overflow-openrouter.yaml`
+and [docs/openrouter.md](docs/openrouter.md). Assumed, unverified against the real service.
+
 ## `glaring doctor`
 
 Read-only dependency check: container runtime installed/running/version, VM or

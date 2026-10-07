@@ -242,6 +242,17 @@ class AwsCreds(unittest.TestCase):
                 os.environ["PATH"] = old
 
 
+class Examples(unittest.TestCase):
+    def test_openrouter_example(self):
+        p = g.load_pod(ROOT / "examples" / "pods" / "overflow-openrouter.yaml")
+        self.assertEqual(g.model_hosts(p["model"]), ["openrouter.ai"])
+        toml = g.codex_toml(p["model"])
+        self.assertIn('base_url = "https://openrouter.ai/api/v1"', toml)
+        self.assertIn('env_key = "OPENROUTER_API_KEY"', toml)
+        self.assertNotIn("sk-or", toml)
+        self.assertEqual(p["secrets"], ["OPENROUTER_API_KEY"])
+
+
 class Doctor(unittest.TestCase):
     def setUp(self):
         sys.path.insert(0, str(ROOT))

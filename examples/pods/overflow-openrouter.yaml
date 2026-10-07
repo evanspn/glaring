@@ -1,0 +1,19 @@
+# Example: a pod whose model backend is OpenRouter (pay per token), for use as
+# overflow when a plan-limited seat is blocked. Not started by default: this is
+# outside pods/. Try it with:
+#   ./glaring --pods examples/pods up --env-file .env overflow
+#
+# Put OPENROUTER_API_KEY in .env (see .env.example). Create that key in the
+# OpenRouter dashboard WITH a credit limit: the limit is the spend guard.
+name: overflow
+cpus: 2
+memory: 4g
+pids: 512
+model:
+  provider: custom
+  base_url: https://openrouter.ai/api/v1   # its host is allowlisted for this pod automatically
+  model: moonshotai/kimi-k2.7-code          # any OpenRouter model id; change freely
+  env_key: OPENROUTER_API_KEY
+secrets: [OPENROUTER_API_KEY]
+egress: []
+peers: []
